@@ -753,6 +753,9 @@ out:
 }
 
 #ifdef ENABLE_RULE_GENERATOR
+/* function to return the count of rules that assign NAME= to a value matching arg#2 , defined in udev-rules.c */
+int udev_rules_assigning_name_to(struct udev_rules *rules,const char *match_name);
+
 static void rename_netif_kernel_log(struct ifreq ifr)
 {
         int klog;
@@ -774,15 +777,14 @@ static void rename_netif_kernel_log(struct ifreq ifr)
 }
 #endif
 
-static int rename_netif(struct udev_event *event)
+static int rename_netif_dev_fromname_toname(struct udev_device *dev,const char *oldname,const char *newname)
 {
-        struct udev_device *dev = event->dev;
         int sk;
         struct ifreq ifr;
         int err;
 
         log_debug("changing net interface name from '%s' to '%s'\n",
-                  udev_device_get_sysname(dev), event->name);
+                  oldname, newname);
 
         sk = socket(PF_INET, SOCK_DGRAM, 0);
         if (sk < 0) {
@@ -792,8 +794,8 @@ static int rename_netif(struct udev_event *event)
         }
 
         memset(&ifr, 0x00, sizeof(struct ifreq));
-        util_strscpy(ifr.ifr_name, IFNAMSIZ, udev_device_get_sysname(dev));
-        util_strscpy(ifr.ifr_newname, IFNAMSIZ, event->name);
+        util_strscpy(ifr.ifr_name, IFNAMSIZ, oldname);
+        util_strscpy(ifr.ifr_newname, IFNAMSIZ, newname);
         err = ioctl(sk, SIOCSIFNAME, &ifr);
 
 #ifdef ENABLE_RULE_GENERATOR
@@ -810,7 +812,7 @@ static int rename_netif(struct udev_event *event)
                 goto out;
 
         /* free our own name, another process may wait for us */
-        snprintf(ifr.ifr_newname, IFNAMSIZ, "rename%u", udev_device_get_ifindex(dev));
+        snprintf(ifr.ifr_newname, IFNAMSIZ, "r%s", oldname);
         err = ioctl(sk, SIOCSIFNAME, &ifr);
         if (err < 0) {
                 err = -errno;
@@ -822,7 +824,7 @@ static int rename_netif(struct udev_event *event)
 
         /* wait a maximum of 90 seconds for our target to become available */
         util_strscpy(ifr.ifr_name, IFNAMSIZ, ifr.ifr_newname);
-        util_strscpy(ifr.ifr_newname, IFNAMSIZ, event->name);
+        util_strscpy(ifr.ifr_newname, IFNAMSIZ, newname);
         loop = 90 * 20;
         while (loop--) {
                 const struct timespec duration = { 0, 1000 * 1000 * 1000 / 20 };
@@ -853,6 +855,11 @@ out:
 
         close(sk);
         return err;
+}
+
+static int rename_netif(struct udev_event *event)
+{
+	return rename_netif_dev_fromname_toname(event->dev,udev_device_get_sysname(event->dev),event->name);
 }
 
 int udev_event_execute_rules(struct udev_event *event, struct udev_rules *rules, const sigset_t *sigmask)
@@ -892,11 +899,55 @@ int udev_event_execute_rules(struct udev_event *event, struct udev_rules *rules,
 
                 /* rename a new network interface, if needed */
                 if (udev_device_get_ifindex(dev) > 0 && strcmp(udev_device_get_action(dev), "add") == 0 &&
+#ifdef ENABLE_RULE_GENERATOR
+		    ! ( event->name == NULL || strcmp(event->name, udev_device_get_sysname(dev)) == 0 || 
+		    (err=udev_rules_assigning_name_to(rules,udev_device_get_sysname(dev))) < 1 )) {
+#else
                     event->name != NULL && strcmp(event->name, udev_device_get_sysname(dev)) != 0) {
+#endif
                         char syspath[UTIL_PATH_SIZE];
                         char *pos;
+#ifdef ENABLE_RULE_GENERATOR
+
+			/* err is the number of rules that assign a device with NAME= this sysname */
+			if (err > 0) { /* have a conflict, rename to a temp name */
+	                        char *newpos;
+				char newifname[IFNAMSIZ];
+				int ifidnum;
+
+				/* build the temporary iface name */
+				util_strscpy(newifname, IFNAMSIZ, udev_device_get_sysname(dev));
+				newpos=pos=&newifname[strcspn(newifname,"0123456789")];
+				ifidnum=(int)strtol(pos,&newpos,10);
+				*pos='\0';
+				if (newpos > pos && *newpos == '\0') /* append new iface num to name */
+					/* use udev_device_get_ifindex(dev) instead of ifidnum as it is unique to every iface */
+					snprintf(pos,IFNAMSIZ+(newifname-pos), "%d", 127 - udev_device_get_ifindex(dev));
+
+				err = 1; /* skip the post-rename stuff if no rename occurs */
+
+				/* if sysname isn't already the tmpname (ie there is no numeric component), do the rename */
+				if (strcmp(newifname,udev_device_get_sysname(dev)) != 0) {
+					err = rename_netif_dev_fromname_toname(dev,udev_device_get_sysname(dev),newifname);
+		                        if (err == 0) {
+						log_debug("renamed netif to '%s' for collision avoidance\n", newifname);
+					} else {
+						log_error("could not rename netif to '%s' for collision avoidance\n",newifname);
+					}
+				}
+				/* rename it now to its final target if its not already there */
+				if (event->name != NULL && strcmp(event->name, newifname) != 0)
+					err = rename_netif_dev_fromname_toname(dev,newifname,event->name);
+
+			} else { /* no need to rename to a tempname first, do a regular direct rename to event->name */
+				err = 1; /* skip the post-rename stuff if no rename occurs */
+				if (strcmp(event->name, udev_device_get_sysname(dev)) != 0)
+					err = rename_netif(event);				
+			}
+#else
 
                         err = rename_netif(event);
+#endif
                         if (err == 0) {
                                 log_debug("renamed netif to '%s'\n", event->name);
 

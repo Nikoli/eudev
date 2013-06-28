@@ -1841,6 +1841,73 @@ enum escape_type {
         ESCAPE_REPLACE,
 };
 
+#ifdef ENABLE_RULE_GENERATOR
+/* function to return the count of rules that assign NAME= to a value matching arg#2 */
+int udev_rules_assigning_name_to(struct udev_rules *rules, const char *match_name)
+{
+        struct token *cur;
+        struct token *rule;
+        enum escape_type esc = ESCAPE_UNSET;
+	int count_name_match = 0;
+	bool name_final = false;
+
+        if (rules->tokens == NULL)
+                return 0;
+
+        /* loop through token list, match, run actions or forward to next rule */
+        cur = &rules->tokens[0];
+        rule = cur;
+        for (;;) {
+                dump_token(rules, cur);
+                switch (cur->type) {
+                case TK_RULE:
+                        /* current rule */
+                        rule = cur;
+			if (!rule->rule.can_set_name)
+				goto nomatch;
+			break;
+                case TK_M_SUBSYSTEM:
+                        if (match_key(rules, cur, "net") != 0)
+                                goto nomatch;
+                        break;
+                case TK_M_ACTION:
+                        if (match_key(rules, cur, "add") != 0)
+                                goto nomatch;
+                        break;
+                case TK_A_NAME: {
+                        const char *name  = rules_str(rules, cur->key.value_off);
+                        char name_str[UTIL_PATH_SIZE];
+			int count;
+
+			util_strscpy(name_str,UTIL_PATH_SIZE,name);
+                        count = util_replace_chars(name_str, "/");
+                        if (count > 0)
+                                log_debug("%i character(s) replaced\n", count); 
+                        log_debug("looking for NAME assignment matching %s : NAME '%s' %s:%u\n",
+                                  match_name,
+                                  name,
+                                  rules_str(rules, rule->rule.filename_off),
+                                  rule->rule.filename_line);
+			if (strcmp(name_str,match_name) == 0) {
+				count_name_match++;
+				log_debug("found a match! total: %d\n",count_name_match);
+			}
+			/* skip to next rule */
+                        goto nomatch;
+                }
+                case TK_END:
+                        return count_name_match;
+                }
+
+                cur++;
+                continue;
+        nomatch:
+                /* fast-forward to next rule */
+                cur = rule + rule->rule.token_count;
+        }
+}
+#endif
+
 int udev_rules_apply_to_event(struct udev_rules *rules, struct udev_event *event, const sigset_t *sigmask)
 {
         struct token *cur;
